@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit
+          http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools
+          http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+  <munit:config name="support-agent-test.xml"/>
+
+  <!-- Caminho sem tool-calling: Responses API responde direto, sem function_call -->
+  <munit:test name="agent-direct-answer-test"
+    description="Quando o LLM nao pede tools, o agente responde direto como task completed">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[output application/java --- {
+            id: 'resp-test-001',
+            'output': [
+              {
+                'type': 'message',
+                role: 'assistant',
+                content: [
+                  {
+                    'type': 'output_text',
+                    text: 'Ola! Posso ajudar com pedidos TechWave. Informe o numero do pedido (ex.: TW-1001).'
+                  }
+                ]
+              }
+            ]
+          }]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <munit:set-event doc:name="Simulate A2A task">
+        <munit:payload value="#[output application/java --- {
+          message: {
+            role: 'ROLE_USER',
+            messageId: 'msg-001',
+            parts: [{ text: 'Oi, voces podem me ajudar?' }]
+          }
+        }]"/>
+        <munit:attributes value="#[{ taskId: 'task-001', contextId: 'context-001' }]"/>
+      </munit:set-event>
+      <flow-ref name="support-agent-main-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.id]" is="#[MunitTools::equalTo('task-001')]"/>
+      <munit-tools:assert-that expression="#[payload.status.state]" is="#[MunitTools::equalTo('TASK_STATE_COMPLETED')]"/>
+      <munit-tools:assert-that expression="#[payload.artifacts[0].parts[0].text]"
+        is="#[MunitTools::containsString('TechWave')]"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- Falha no LLM: task retorna failed, sem propagar erro ao cliente A2A -->
+  <munit:test name="agent-llm-error-returns-failed-task-test"
+    description="Erro na chamada ao OpenAI gera task failed com mensagem amigavel">
+    <munit:behavior>
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:error typeId="HTTP:CONNECTIVITY"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+    <munit:execution>
+      <munit:set-event doc:name="Simulate A2A task">
+        <munit:payload value="#[output application/java --- {
+          message: {
+            role: 'ROLE_USER',
+            messageId: 'msg-002',
+            parts: [{ text: 'Qual o status do pedido TW-1001?' }]
+          }
+        }]"/>
+        <munit:attributes value="#[{ taskId: 'task-002', contextId: 'context-002' }]"/>
+      </munit:set-event>
+      <flow-ref name="support-agent-main-flow"/>
+    </munit:execution>
+    <munit:validation>
+      <munit-tools:assert-that expression="#[payload.status.state]" is="#[MunitTools::equalTo('TASK_STATE_FAILED')]"/>
+    </munit:validation>
+  </munit:test>
+
+</mule>

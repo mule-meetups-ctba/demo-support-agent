@@ -1,0 +1,340 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+          http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/a2a
+          http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/mcp
+          http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+  <!-- ============================================================
+       Order Support Agent (A2A)
+       task-listener -> OpenAI (tool-calling) -> MCP tools -> OpenAI
+       -> A2A task response
+       ============================================================ -->
+  <flow name="support-agent-main-flow"
+    doc:name="Order Support Agent Flow"
+    doc:description="A2A agent: receives a task, lets OpenAI pick MCP tools, runs them, then returns the final answer">
+    <a2a:task-listener config-ref="order-support-a2a-server"
+      doc:name="A2A Task Listener"
+      doc:description="Receives inbound A2A tasks for the Order Support Agent and returns the task response">
+      <a2a:response>
+        <a2a:response><![CDATA[#[payload]]]></a2a:response>
+        <a2a:response-headers><![CDATA[#[%dw 2.0
+output application/java
+---
+{ "Content-Type": "application/json" }]]]></a2a:response-headers>
+      </a2a:response>
+    </a2a:task-listener>
+
+    <ee:transform doc:name="Extract task vars"
+      doc:description="Extracts taskId, contextId and the user prompt text from the incoming A2A task">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+payload]]></ee:set-payload>
+      </ee:message>
+      <ee:variables>
+        <ee:set-variable variableName="taskId"><![CDATA[attributes.taskId default uuid()]]></ee:set-variable>
+        <ee:set-variable variableName="contextId"><![CDATA[attributes.contextId default ("context-" ++ uuid())]]></ee:set-variable>
+        <ee:set-variable variableName="userPrompt"><![CDATA[payload.message.parts[0].text]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <logger level="INFO" category="com.techwave.support.agent"
+      doc:name="Flow start"
+      doc:description="Logs START tracePoint with the taskId and the user prompt"
+      message="#[output application/json --- {message: 'A2A task received', tracePoint: 'START'} ++ ({ taskId: vars.taskId, userPrompt: vars.userPrompt })]"/>
+
+    <!-- 1a chamada OpenAI: decide quais tools usar -->
+    <ee:transform doc:name="Build OpenAI request (with tools)"
+      doc:description="Builds the first OpenAI request with the system prompt, user prompt and the four tool definitions">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var systemPrompt = "Voce e o agente de suporte de pedidos da TechWave Electronics. " ++
+  "Responda em portugues, de forma curta e objetiva. " ++
+  "Use as tools disponiveis para consultar pedidos, abrir cases, processar reembolsos e notificar o time. " ++
+  "Nunca invente dados de pedidos: sempre consulte get-order-status primeiro. " ++
+  "GUARDRAIL DE REEMBOLSO: antes de chamar refund-payment, verifique o payment.status retornado por get-order-status. " ++
+  "Se o pagamento ja estiver como refunded, NAO chame refund-payment: informe educadamente que o reembolso ja foi processado e nao crie um novo. " ++
+  "Apos criar um case ou reembolso, notifique o time com notify-team."
+---
+{
+  model: p('config.openai.model'),
+  'input': [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: vars.userPrompt }
+  ],
+  tools: [
+    {
+      "type": "function",
+      name: "get-order-status",
+      description: "Retorna status, itens e pagamento de um pedido TechWave",
+      parameters: {
+        "type": "object",
+        properties: { orderId: { "type": "string", description: "Id do pedido, ex.: TW-1001" } },
+        required: ["orderId"]
+      }
+    },
+    {
+      "type": "function",
+      name: "create-support-case",
+      description: "Abre um Case de suporte no Salesforce",
+      parameters: {
+        "type": "object",
+        properties: {
+          orderId: { "type": "string" },
+          subject: { "type": "string" },
+          description: { "type": "string" },
+          priority: { "type": "string", "enum": ["Low", "Medium", "High"] }
+        },
+        required: ["orderId", "subject", "description", "priority"]
+      }
+    },
+    {
+      "type": "function",
+      name: "refund-payment",
+      description: "Cria reembolso total no Stripe para um PaymentIntent",
+      parameters: {
+        "type": "object",
+        properties: {
+          paymentIntentId: { "type": "string" },
+          reason: { "type": "string", "enum": ["duplicate", "fraudulent", "requested_by_customer"] }
+        },
+        required: ["paymentIntentId", "reason"]
+      }
+    },
+    {
+      "type": "function",
+      name: "notify-team",
+      description: "Envia notificacao ao canal de suporte no Slack",
+      parameters: {
+        "type": "object",
+        properties: { message: { "type": "string" } },
+        required: ["message"]
+      }
+    }
+  ]
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO" category="com.techwave.support.agent"
+      doc:name="Before OpenAI call 1"
+      doc:description="Logs BEFORE_REQUEST before the first OpenAI call (tool selection)"
+      message="#[output application/json --- {message: 'Calling OpenAI (tool selection)', tracePoint: 'BEFORE_REQUEST'}]"/>
+
+    <http:request config-ref="openai-request-config" method="POST" path="/responses" responseTimeout="60000"
+      doc:name="OpenAI tool selection"
+      doc:description="Calls OpenAI Responses API to decide which support tools to invoke"/>
+
+    <logger level="INFO" category="com.techwave.support.agent"
+      doc:name="After OpenAI call 1"
+      doc:description="Logs AFTER_REQUEST with the number of tool calls OpenAI requested"
+      message="#[output application/json --- {message: 'OpenAI responded (tool selection)', tracePoint: 'AFTER_REQUEST'} ++ ({
+        toolCalls: sizeOf((payload.'output' default []) filter ($.'type' == 'function_call'))
+      })]"/>
+
+    <set-variable variableName="openaiResponseId" value="#[payload.id]"
+      doc:name="Set openaiResponseId"
+      doc:description="Stores the Responses API response id for the follow-up call with tool outputs"/>
+    <set-variable variableName="toolCalls" value="#[(payload.'output' default []) filter ($.'type' == 'function_call')]"
+      doc:name="Set toolCalls"
+      doc:description="Stores the Responses API function_call output items for MCP execution"/>
+    <set-variable variableName="assistantText" value="#[((payload.'output' default []) filter ($.'type' == 'message'))[0].content[0].text default null]"
+      doc:name="Set assistantText"
+      doc:description="Stores the direct assistant text when no tool calls are needed"/>
+    <set-variable variableName="toolResults" value="#[[]]"
+      doc:name="Init toolResults"
+      doc:description="Initialises the empty list that will collect MCP tool results"/>
+
+    <choice doc:name="Tool calls requested?"
+      doc:description="Branches on whether OpenAI requested any tool calls">
+      <when expression="#[not isEmpty(vars.toolCalls default [])]"
+        doc:name="Tools requested"
+        doc:description="Runs each requested MCP tool then asks OpenAI for the final answer">
+
+        <foreach collection="#[vars.toolCalls]"
+          doc:name="For each tool call"
+          doc:description="Iterates over every tool call OpenAI requested">
+          <set-variable variableName="currentCall" value="#[payload]"
+            doc:name="Set currentCall"
+            doc:description="Stores the current tool call being processed"/>
+
+          <logger level="INFO" category="com.techwave.support.agent"
+            doc:name="Before MCP tool call"
+            doc:description="Logs BEFORE_REQUEST with the name of the MCP tool about to be called"
+            message="#[output application/json --- {message: 'Calling MCP tool: ' ++ vars.currentCall.name, tracePoint: 'BEFORE_REQUEST'} ++ ({
+              arguments: vars.currentCall.arguments default '{}'
+            })]"/>
+
+          <mcp:call-tool config-ref="techwave-mcp-client" toolName="#[vars.currentCall.name]"
+            doc:name="Call MCP tool"
+            doc:description="Invokes the named MCP tool on the TechWave Support MCP Server with the parsed arguments">
+            <mcp:arguments><![CDATA[#[output application/java
+---
+read(vars.currentCall.arguments default "{}", "application/json")]]]></mcp:arguments>
+          </mcp:call-tool>
+
+          <ee:transform doc:name="Extract MCP tool output"
+            doc:description="Extracts the raw MCP text content for the OpenAI Responses function_call_output item">
+            <ee:variables>
+              <ee:set-variable variableName="toolOutput"><![CDATA[%dw 2.0
+output application/java
+var rawText = attributes.rawMcpResponse.contents[0].text default payload.contents[0].text default null
+---
+rawText default write(payload, "application/json") default "sem resultado"
+]]></ee:set-variable>
+            </ee:variables>
+          </ee:transform>
+
+          <logger level="INFO" category="com.techwave.support.agent"
+            doc:name="After MCP tool call"
+            doc:description="Logs AFTER_REQUEST once the MCP tool has responded"
+            message="#[output application/json --- {message: 'MCP tool responded: ' ++ vars.currentCall.name, tracePoint: 'AFTER_REQUEST'} ++ ({
+              resultPreview: vars.toolOutput
+            })]"/>
+
+          <ee:transform doc:name="Append tool result"
+            doc:description="Appends the MCP tool result as a Responses API function_call_output keyed by call_id">
+            <ee:variables>
+              <ee:set-variable variableName="toolResults"><![CDATA[%dw 2.0
+output application/java
+---
+vars.toolResults ++ [{
+  'type': 'function_call_output',
+  call_id: vars.currentCall.call_id,
+  'output': vars.toolOutput
+}]]]></ee:set-variable>
+            </ee:variables>
+          </ee:transform>
+        </foreach>
+
+        <!-- 2a chamada OpenAI: resposta final com os resultados das tools -->
+        <ee:transform doc:name="Build OpenAI request (final answer)"
+          doc:description="Builds the second OpenAI request, appending the assistant message and tool results">
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  model: p('config.openai.model'),
+  previous_response_id: vars.openaiResponseId,
+  'input': vars.toolResults
+}]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+
+        <logger level="INFO" category="com.techwave.support.agent"
+          doc:name="Before OpenAI call 2"
+          doc:description="Logs BEFORE_REQUEST before the second OpenAI call (final answer)"
+          message="#[output application/json --- {message: 'Calling OpenAI (final answer)', tracePoint: 'BEFORE_REQUEST'}]"/>
+
+        <http:request config-ref="openai-request-config" method="POST" path="/responses" responseTimeout="60000"
+          doc:name="OpenAI final answer"
+          doc:description="Calls OpenAI Responses API again with the tool results to produce the final answer"/>
+
+        <logger level="INFO" category="com.techwave.support.agent"
+          doc:name="After OpenAI call 2"
+          doc:description="Logs AFTER_REQUEST once OpenAI has returned the final answer"
+          message="#[output application/json --- {message: 'OpenAI responded (final answer)', tracePoint: 'AFTER_REQUEST'}]"/>
+
+        <set-variable variableName="finalAnswer" value="#[((payload.'output' default []) filter ($.'type' == 'message'))[0].content[0].text default 'Nao consegui processar a solicitacao.']"
+          doc:name="Set finalAnswer"
+          doc:description="Stores the OpenAI final answer text for the A2A response"/>
+      </when>
+      <otherwise doc:name="No tools requested"
+        doc:description="Uses the assistant message directly when OpenAI requested no tools">
+        <set-variable variableName="finalAnswer"
+          value="#[vars.assistantText default 'Nao consegui processar a solicitacao.']"
+          doc:name="Set finalAnswer (no tools)"
+          doc:description="Stores the assistant content, or a fallback message when none is present"/>
+      </otherwise>
+    </choice>
+
+    <!-- Resposta A2A (task completed) — A2A protocol 1.0.0:
+         - estados usam constantes TASK_STATE_* (antes: "completed" minúsculo)
+         - role usa constantes ROLE_* (antes: "agent")
+         - Task/Message/Part não têm mais o discriminador "kind": o tipo do Part
+           é inferido pela chave presente ({ text: ... } = TextPart) -->
+    <ee:transform doc:name="Build A2A task response"
+      doc:description="Builds the completed A2A 1.0 task response with the final answer as message and artifact">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  id: vars.taskId,
+  contextId: vars.contextId,
+  status: {
+    state: "TASK_STATE_COMPLETED",
+    message: {
+      role: "ROLE_AGENT",
+      messageId: uuid(),
+      parts: [{ text: vars.finalAnswer }]
+    }
+  },
+  artifacts: [
+    {
+      artifactId: "artifact-" ++ vars.taskId,
+      name: "answer",
+      parts: [{ text: vars.finalAnswer }]
+    }
+  ]
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO" category="com.techwave.support.agent"
+      doc:name="Flow end"
+      doc:description="Logs END tracePoint with the completed taskId"
+      message="#[output application/json --- {message: 'A2A task completed', tracePoint: 'END'} ++ ({ taskId: vars.taskId })]"/>
+
+    <error-handler>
+      <on-error-continue type="ANY" logException="false">
+        <logger level="ERROR" category="com.techwave.support.agent"
+          doc:name="Log agent error"
+          doc:description="Logs EXCEPTION tracePoint with the error type and description on any failure"
+          message="#[output application/json --- {message: 'Agent task failed: ' ++ error.description, tracePoint: 'EXCEPTION'} ++ ({
+            taskId: vars.taskId default 'unknown',
+            errorType: error.errorType.identifier default 'UNKNOWN',
+            errorDescription: error.description
+          })]"/>
+        <ee:transform doc:name="Build A2A failed task"
+          doc:description="Builds a failed A2A task response carrying a friendly error message back to the caller">
+          <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  id: vars.taskId default uuid(),
+  contextId: vars.contextId default "context-error",
+  status: {
+    state: "TASK_STATE_FAILED",
+    message: {
+      role: "ROLE_AGENT",
+      messageId: uuid(),
+      parts: [{ text: "Desculpe, ocorreu um erro ao processar sua solicitacao: " ++ (error.description default "erro inesperado") }]
+    }
+  }
+}]]></ee:set-payload>
+          </ee:message>
+        </ee:transform>
+      </on-error-continue>
+    </error-handler>
+  </flow>
+
+</mule>

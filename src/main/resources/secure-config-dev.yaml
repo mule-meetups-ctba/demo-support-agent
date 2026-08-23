@@ -1,0 +1,11 @@
+# Segredos CIFRADOS (Secure Configuration Properties module) — gerado por encrypt-secrets.sh.
+# NUNCA commitar valores em texto puro. Apenas o resultado cifrado entre ![ ... ].
+# Cifrado com AES/CBC; use a MESMA chave em -Dencryption.key no deploy.
+openai:
+  api:
+    key: "CHANGE-ME"
+mcp:
+  # client_secret do contrato "agent-to-mcp-server". Cifre com:
+  #   java -jar secure-properties-tool.jar string encrypt AES CBC <CHAVE_16> "<client_secret>"
+  # e cole a saída entre os ![ ... ] abaixo.
+  clientSecret: "![REPLACE_WITH_ENCRYPTED_AGENT_TO_MCP_CLIENT_SECRET]"

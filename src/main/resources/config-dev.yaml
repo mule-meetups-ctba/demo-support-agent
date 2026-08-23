@@ -1,0 +1,19 @@
+config:
+  environment: "dev"
+  http:
+    port: "8081"
+  agent:
+    # URL pública do agente via Public Ingress Omni Gateway
+    publicUrl: "https://<meetup-ingress-gw-host>.cloudhub.io/techwave-order-support-agent"
+  openai:
+    host: "<recurso>.services.ai.azure.com"
+    basePath: "/openai/v1"
+    model: "gpt-5.4-mini"
+  mcp:
+    # URL do TechWave Support MCP Server via Private Egress Omni Gateway
+    serverUrl: "https://<meetup-egress-gw-host>.cloudhub.io/techwave-support-mcp-server"
+    endpointPath: "/mcp"
+    # client_id do contrato "agent-to-mcp-server" (Tool/MCP instance
+    # techwave-support-mcp-server com Client ID Enforcement).
+    # O client_secret correspondente é secure property: mcp.clientSecret
+    clientId: "REPLACE_WITH_AGENT_TO_MCP_CLIENT_ID"
