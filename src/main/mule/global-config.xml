@@ -55,7 +55,7 @@
 		agentPath. -->
 	<a2a:server-config name="order-support-a2a-server"
 		doc:name="Order Support A2A Server"
-		doc:description="A2A server (protocol 1.0.0) exposing the agent at /agents/order-support/rpc with its agent card">
+		doc:description="A2A server (protocol 1.0.0) exposing the agent at ${config.agent.path}/rpc with its agent card">
 		<a2a:connection
 			listenerConfig="agent-http-listener-config"
 			agentPath="${config.agent.path}">
