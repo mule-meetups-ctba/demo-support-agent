@@ -3,6 +3,8 @@
       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
       xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
       xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
       xsi:schemaLocation="
         http://www.mulesoft.org/schema/mule/core
@@ -10,17 +12,36 @@
         http://www.mulesoft.org/schema/mule/munit
           http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
         http://www.mulesoft.org/schema/mule/munit-tools
-          http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+          http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/a2a
+          http://www.mulesoft.org/schema/mule/a2a/current/mule-a2a.xsd
+        http://www.mulesoft.org/schema/mule/mcp
+          http://www.mulesoft.org/schema/mule/mcp/current/mule-mcp.xsd">
 
   <munit:config name="support-agent-test.xml"/>
 
-  <!-- Caminho sem tool-calling: Responses API responde direto, sem function_call -->
+  <!-- ============================================================
+       A2A Connector 2.0: o flow NÃO devolve mais um Task como payload.
+       Ele emite eventos (update-task-artifact / update-task-status) e o
+       connector materializa a resposta a partir do estado persistido.
+
+       Por isso os testes deixaram de afirmar sobre o payload final e passaram a:
+         1. MOCKAR as operações a2a (elas precisariam de um task store real);
+         2. VERIFICAR que foram chamadas — inclusive o status terminal, que é
+            o que de fato dispara a resposta ao cliente.
+       ============================================================ -->
+
+  <!-- Caminho sem tool-calling: o LLM responde direto, sem function_call -->
   <munit:test name="agent-direct-answer-test"
-    description="Quando o LLM nao pede tools, o agente responde direto como task completed">
+    description="Sem tools, o agente publica o artifact e fecha a task como completed">
     <munit:behavior>
+      <!-- O mock precisa devolver application/json, nao um Map Java: o
+           http:request real entrega um stream JSON, e qualquer expressao
+           sobre ele (payload.id) estoura com "requires a Stream Compatible
+           content" se o mock vier como application/java. -->
       <munit-tools:mock-when processor="http:request">
         <munit-tools:then-return>
-          <munit-tools:payload value="#[output application/java --- {
+          <munit-tools:payload mediaType="application/json" value="#[output application/json --- {
             id: 'resp-test-001',
             'output': [
               {
@@ -37,7 +58,19 @@
           }]"/>
         </munit-tools:then-return>
       </munit-tools:mock-when>
+
+      <munit-tools:mock-when processor="a2a:update-task-artifact">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="a2a:update-task-status">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
     </munit:behavior>
+
     <munit:execution>
       <munit:set-event doc:name="Simulate A2A task">
         <munit:payload value="#[output application/java --- {
@@ -51,24 +84,36 @@
       </munit:set-event>
       <flow-ref name="support-agent-main-flow"/>
     </munit:execution>
+
     <munit:validation>
-      <munit-tools:assert-that expression="#[payload.id]" is="#[MunitTools::equalTo('task-001')]"/>
-      <munit-tools:assert-that expression="#[payload.status.state]" is="#[MunitTools::equalTo('TASK_STATE_COMPLETED')]"/>
-      <munit-tools:assert-that expression="#[payload.artifacts[0].parts[0].text]"
+      <!-- o taskId veio dos attributes do listener -->
+      <munit-tools:assert-that expression="#[vars.taskId]"
+        is="#[MunitTools::equalTo('task-001')]"/>
+      <!-- a resposta do LLM chegou até a variável usada nos eventos A2A -->
+      <munit-tools:assert-that expression="#[vars.finalAnswer]"
         is="#[MunitTools::containsString('TechWave')]"/>
+      <!-- e os dois eventos A2A foram emitidos -->
+      <munit-tools:verify-call processor="a2a:update-task-artifact" times="1"/>
+      <munit-tools:verify-call processor="a2a:update-task-status" times="1"/>
     </munit:validation>
   </munit:test>
 
-  <!-- Falha no LLM: task retorna failed, sem propagar erro ao cliente A2A -->
+  <!-- Falha no LLM: a task fecha como failed, sem propagar erro ao cliente A2A -->
   <munit:test name="agent-llm-error-returns-failed-task-test"
-    description="Erro na chamada ao OpenAI gera task failed com mensagem amigavel">
+    description="Erro na chamada ao LLM fecha a task com status terminal de falha">
     <munit:behavior>
       <munit-tools:mock-when processor="http:request">
         <munit-tools:then-return>
           <munit-tools:error typeId="HTTP:CONNECTIVITY"/>
         </munit-tools:then-return>
       </munit-tools:mock-when>
+      <munit-tools:mock-when processor="a2a:update-task-status">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
     </munit:behavior>
+
     <munit:execution>
       <munit:set-event doc:name="Simulate A2A task">
         <munit:payload value="#[output application/java --- {
@@ -82,8 +127,182 @@
       </munit:set-event>
       <flow-ref name="support-agent-main-flow"/>
     </munit:execution>
+
     <munit:validation>
-      <munit-tools:assert-that expression="#[payload.status.state]" is="#[MunitTools::equalTo('TASK_STATE_FAILED')]"/>
+      <!-- o error handler emitiu o status terminal de falha... -->
+      <munit-tools:verify-call processor="a2a:update-task-status" times="1"/>
+      <!-- ...e nenhum artifact foi publicado, já que não houve resposta -->
+      <munit-tools:verify-call processor="a2a:update-task-artifact" times="0"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============================================================
+       Correção B — o loop encerra sozinho quando o LLM para de pedir
+       tools, e a tool pedida é de fato executada.
+
+       O mock nao recebe a requisicao real (o then-return e avaliado
+       sobre um evento vazio), entao sequenciar respostas por conteudo
+       nao funciona. Distinguimos pelos dois <http:request> do flow, que
+       tem doc:name diferentes: "OpenAI tool selection" e a abertura,
+       "OpenAI next step" e a chamada de dentro da rodada.
+       ============================================================ -->
+  <munit:test name="agent-tool-loop-completes-and-runs-tool-test"
+    description="O agente executa a tool pedida e encerra o loop quando o LLM responde com texto">
+    <munit:behavior>
+      <!-- abertura: o modelo pede notify-team -->
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="doc:name" whereValue="OpenAI tool selection"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:payload mediaType="application/json" value="#[output application/json --- {
+            id: 'resp-loop-001',
+            'output': [
+              { 'type': 'function_call', name: 'notify-team', call_id: 'call-001',
+                arguments: '{&quot;message&quot;:&quot;[TechWave] reembolso do TW-1002 processado&quot;}' }
+            ]
+          }]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+
+      <!-- dentro da rodada: com o resultado da tool em maos, o modelo fecha
+           com texto. No agente antigo esta chamada existia, mas ia SEM o
+           catalogo de tools e sem nunca ter executado a tool pedida. -->
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:with-attributes>
+          <munit-tools:with-attribute attributeName="doc:name" whereValue="OpenAI next step"/>
+        </munit-tools:with-attributes>
+        <munit-tools:then-return>
+          <munit-tools:payload mediaType="application/json" value="#[output application/json --- {
+            id: 'resp-loop-002',
+            'output': [
+              { 'type': 'message', role: 'assistant',
+                content: [{ 'type': 'output_text', text: 'Reembolso do pedido TW-1002 processado e time avisado.' }] }
+            ]
+          }]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+
+      <munit-tools:mock-when processor="mcp:call-tool">
+        <munit-tools:then-return>
+          <munit-tools:payload mediaType="application/java" value="#[output application/java --- {
+            contents: [{ text: '{&quot;ok&quot;:true}' }]
+          }]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+
+      <munit-tools:mock-when processor="a2a:update-task-artifact">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="a2a:update-task-status">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+
+    <munit:execution>
+      <munit:set-event doc:name="Simulate A2A task">
+        <munit:payload value="#[output application/java --- {
+          message: {
+            role: 'ROLE_USER',
+            messageId: 'msg-003',
+            parts: [{ text: 'O monitor do pedido TW-1002 chegou com defeito. Quero reembolso.' }]
+          }
+        }]"/>
+        <munit:attributes value="#[{ taskId: 'task-003', contextId: 'context-003' }]"/>
+      </munit:set-event>
+      <flow-ref name="support-agent-main-flow"/>
+    </munit:execution>
+
+    <munit:validation>
+      <!-- uma rodada bastou, e o loop parou sozinho: nao foi o teto -->
+      <munit-tools:assert-that expression="#[vars.toolIteration]"
+        is="#[MunitTools::equalTo(1)]"/>
+      <munit-tools:assert-that expression="#[isEmpty(vars.toolCalls default [])]"
+        is="#[MunitTools::equalTo(true)]"/>
+      <!-- a tool pedida foi mesmo executada -->
+      <munit-tools:verify-call processor="mcp:call-tool" times="1"/>
+      <!-- e a resposta final e o texto do LLM, nao o fallback de handoff -->
+      <munit-tools:assert-that expression="#[vars.finalAnswer]"
+        is="#[MunitTools::containsString('time avisado')]"/>
+      <munit-tools:verify-call processor="a2a:update-task-artifact" times="1"/>
+      <munit-tools:verify-call processor="a2a:update-task-status" times="1"/>
+    </munit:validation>
+  </munit:test>
+
+  <!-- ============================================================
+       O teto (config.agent.maxToolIterations) corta o loop.
+       Sem ele, um modelo que insiste em pedir tools faria o agente
+       girar e queimar tokens até o timeout da task.
+       ============================================================ -->
+  <munit:test name="agent-tool-loop-respects-ceiling-test"
+    description="O loop para no teto de rodadas mesmo se o LLM continuar pedindo tools">
+    <munit:behavior>
+      <!-- um único then-return: o modelo pede get-order-status para sempre -->
+      <munit-tools:mock-when processor="http:request">
+        <munit-tools:then-return>
+          <munit-tools:payload mediaType="application/json" value="#[output application/json --- {
+            id: 'resp-ceiling-001',
+            'output': [
+              {
+                'type': 'function_call',
+                name: 'get-order-status',
+                call_id: 'call-ceiling',
+                arguments: '{&quot;orderId&quot;:&quot;TW-1001&quot;}'
+              }
+            ]
+          }]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+
+      <munit-tools:mock-when processor="mcp:call-tool">
+        <munit-tools:then-return>
+          <munit-tools:payload mediaType="application/java" value="#[output application/java --- {
+            contents: [{ text: '{&quot;ok&quot;:true}' }]
+          }]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+
+      <munit-tools:mock-when processor="a2a:update-task-artifact">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+      <munit-tools:mock-when processor="a2a:update-task-status">
+        <munit-tools:then-return>
+          <munit-tools:payload value="#[{}]"/>
+        </munit-tools:then-return>
+      </munit-tools:mock-when>
+    </munit:behavior>
+
+    <munit:execution>
+      <munit:set-event doc:name="Simulate A2A task">
+        <munit:payload value="#[output application/java --- {
+          message: {
+            role: 'ROLE_USER',
+            messageId: 'msg-004',
+            parts: [{ text: 'Status do TW-1001?' }]
+          }
+        }]"/>
+        <munit:attributes value="#[{ taskId: 'task-004', contextId: 'context-004' }]"/>
+      </munit:set-event>
+      <flow-ref name="support-agent-main-flow"/>
+    </munit:execution>
+
+    <munit:validation>
+      <!-- parou exatamente no teto de config-dev.yaml (5), sem girar sem fim -->
+      <munit-tools:assert-that expression="#[vars.toolIteration]"
+        is="#[MunitTools::equalTo(5)]"/>
+      <!-- 5 rodadas = 5 execucoes de tool. E esta a prova da Correcao B: o
+           agente antigo executava tools numa rodada so, sempre. -->
+      <munit-tools:verify-call processor="mcp:call-tool" times="5"/>
+      <!-- e a task ainda fecha, com a mensagem de handoff em vez de texto do LLM -->
+      <munit-tools:assert-that expression="#[vars.finalAnswer]"
+        is="#[MunitTools::containsString('atendente')]"/>
+      <munit-tools:verify-call processor="a2a:update-task-status" times="1"/>
     </munit:validation>
   </munit:test>
 

@@ -31,14 +31,15 @@ java -jar secure-properties-tool.jar string encrypt AES CBC <CHAVE_16_CHARS> "<v
 
 Cole a saída entre os `![ ... ]` no `secure-config-dev.yaml`.
 
-Para cifrar todos de uma vez, use `scripts/encrypt-secrets.sh` — ele lê os valores de
-variáveis de ambiente e nunca recebe segredo por argumento (que ficaria no histórico do shell):
+Use `scripts/encrypt-secrets.sh` — ele lê os valores de variáveis de ambiente (nunca por
+argumento, que ficaria no histórico do shell), cifra e reescreve o `secure-config-dev.yaml`
+deste projeto:
 
 ```bash
 export ENC_KEY='SuaChaveDe16Char'
 export OPENAI_API_KEY='...'
 export MCP_CLIENT_SECRET='...'
-bash scripts/encrypt-secrets.sh
+bash scripts/encrypt-secrets.sh --jar /caminho/secure-properties-tool.jar
 ```
 
 ## No deploy

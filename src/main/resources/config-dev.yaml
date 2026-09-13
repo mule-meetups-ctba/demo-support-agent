@@ -4,16 +4,27 @@ config:
     port: "8081"
   agent:
     # URL pública do agente via Public Ingress Omni Gateway
-    publicUrl: "https://<meetup-ingress-gw-host>.cloudhub.io/techwave-order-support-agent"
+    publicUrl: "https://<ingress-gw-host>/techwave-order-support-agent"
+    # Path em que o A2A server escuta DENTRO do app.
+    # REGRA (A2A Connector 2.0): no startup o connector valida que cada
+    # <a2a:interface> tem uma entrada correspondente em supportedInterfaces do card,
+    # comparando o PATH da URL anunciada com a superficie local (agentPath + path da
+    # interface). Logo este valor TEM que ser exatamente o path de publicUrl acima.
+    # Na pratica: o base path da instancia no ingress == agentPath. Se divergirem, o
+    # listener e derrubado no startup e o app fica no ar sem nenhuma rota A2A.
+    path: "/techwave-order-support-agent"
+    # Teto de rodadas do loop de tool-calling (Correcao B). Evita loop infinito
+    # e custo descontrolado quando o modelo insiste em pedir tools.
+    maxToolIterations: "5"
   openai:
     host: "<recurso>.services.ai.azure.com"
     basePath: "/openai/v1"
     model: "gpt-5.4-mini"
   mcp:
     # URL do TechWave Support MCP Server via Private Egress Omni Gateway
-    serverUrl: "https://<meetup-egress-gw-host>.cloudhub.io/techwave-support-mcp-server"
+    serverUrl: "https://<ingress-gw-host>/techwave-support-mcp-server"
     endpointPath: "/mcp"
     # client_id do contrato "agent-to-mcp-server" (Tool/MCP instance
     # techwave-support-mcp-server com Client ID Enforcement).
     # O client_secret correspondente é secure property: mcp.clientSecret
-    clientId: "REPLACE_WITH_AGENT_TO_MCP_CLIENT_ID"
+    clientId: "<client_id-do-contrato>"

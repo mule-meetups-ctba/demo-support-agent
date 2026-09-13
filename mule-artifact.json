@@ -1,12 +1,15 @@
 {
   "minMuleVersion": "4.12.0",
-  "javaSpecificationVersions": ["17"],
+  "javaSpecificationVersions": [
+    "17"
+  ],
   "configs": [
     "global-config.xml",
     "support-agent.xml"
   ],
   "secureProperties": [
-    "openai.api.key"
+    "openai.api.key",
+    "mcp.clientSecret"
   ],
   "classLoaderModelLoaderDescriptor": {
     "id": "mule",

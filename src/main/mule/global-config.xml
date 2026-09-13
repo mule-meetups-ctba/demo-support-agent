@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
-      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-      xmlns:http="http://www.mulesoft.org/schema/mule/http"
-      xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
-      xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
-      xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
-      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
-      xsi:schemaLocation="
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns:a2a="http://www.mulesoft.org/schema/mule/a2a"
+	xmlns:mcp="http://www.mulesoft.org/schema/mule/mcp"
+	xmlns:secure-properties="http://www.mulesoft.org/schema/mule/secure-properties"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xsi:schemaLocation="
         http://www.mulesoft.org/schema/mule/core
           http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/http
@@ -18,38 +18,53 @@
         http://www.mulesoft.org/schema/mule/secure-properties
           http://www.mulesoft.org/schema/mule/secure-properties/current/mule-secure-properties.xsd">
 
-  <configuration-properties file="config-${config.environment}.yaml"
-    doc:name="Environment properties"
-    doc:description="Loads config-${config.environment}.yaml with the agent public URL, OpenAI and MCP server endpoints"/>
+	<configuration-properties
+		file="config-${config.environment}.yaml"
+		doc:name="Environment properties"
+		doc:description="Loads config-${config.environment}.yaml with the agent public URL, OpenAI and MCP server endpoints" />
 
-  <secure-properties:config name="secure-config"
-    file="secure-config-${config.environment}.yaml"
-    key="${encryption.key}"
-    doc:name="Secure Properties"
-    doc:description="Decrypts the secrets in secure-config-${config.environment}.yaml using the runtime encryption key">
-    <secure-properties:encrypt algorithm="AES" mode="CBC"/>
-  </secure-properties:config>
+	<secure-properties:config name="secure-config"
+		file="secure-config-${config.environment}.yaml"
+		key="${encryption.key}" doc:name="Secure Properties"
+		doc:description="Decrypts the secrets in secure-config-${config.environment}.yaml using the runtime encryption key">
+		<secure-properties:encrypt algorithm="AES"
+			mode="CBC" />
+	</secure-properties:config>
 
-  <http:listener-config name="agent-http-listener-config"
-    doc:name="Agent HTTP Listener"
-    doc:description="Inbound HTTP listener backing the A2A server endpoint behind the ingress Omni Gateway">
-    <http:listener-connection host="0.0.0.0" port="${config.http.port}"/>
-  </http:listener-config>
+	<http:listener-config
+		name="agent-http-listener-config" doc:name="Agent HTTP Listener"
+		doc:description="Inbound HTTP listener backing the A2A server endpoint behind the ingress Omni Gateway">
+		<http:listener-connection host="0.0.0.0"
+			port="${config.http.port}" />
+	</http:listener-config>
 
-  <!-- A2A Server (A2A Connector 2.0 / A2A protocol 1.0.0): expõe o agente em
-       /agents/order-support/rpc (agentPath + interface path). A2A-Version: 1.0
-       é enviado automaticamente pelo client connector; no server, o bind
-       JSON-RPC é declarado explicitamente via <a2a:interfaces>. -->
-  <a2a:server-config name="order-support-a2a-server"
-    doc:name="Order Support A2A Server"
-    doc:description="A2A server (protocol 1.0.0) exposing the agent at /agents/order-support/rpc with its agent card">
-    <a2a:connection listenerConfig="agent-http-listener-config" agentPath="/agents/order-support">
-      <a2a:interfaces>
-        <a2a:interface protocol="JSONRPC" path="/rpc"/>
-      </a2a:interfaces>
-    </a2a:connection>
-    <a2a:agent-card>
-      <a2a:json><![CDATA[{
+	<!-- A2A Server (A2A Connector 2.0 / A2A protocol 1.0.0): expõe o agente 
+		em ${config.agent.path}/rpc (agentPath + interface path). A2A-Version: 1.0 
+		é enviado automaticamente pelo client connector; no server, o bind JSON-RPC 
+		é declarado explicitamente via <a2a:interfaces>.
+
+		ARMADILHA QUE CUSTOU UM DEPLOY: o agentPath era /agents/order-support enquanto 
+		o card anunciava a URL pública do gateway (/techwave-order-support-agent/rpc). 
+		A validação de bijeção do startup compara o PATH da URL de cada entrada de 
+		supportedInterfaces com a superfície local (agentPath + path da interface) — 
+		e derrubou o listener com "No AgentCard.supportedInterfaces entry advertises 
+		the configured surface". O app ficava no ar, porta bound, e TODA requisição 
+		batia em "Available listeners are: []". Ou seja: o connector não admite que o 
+		gateway reescreva o path. O base path da instância no ingress tem que ser 
+		igual ao agentPath, e o Upstream da instância aponta para <host-do-app> + 
+		agentPath. -->
+	<a2a:server-config name="order-support-a2a-server"
+		doc:name="Order Support A2A Server"
+		doc:description="A2A server (protocol 1.0.0) exposing the agent at /agents/order-support/rpc with its agent card">
+		<a2a:connection
+			listenerConfig="agent-http-listener-config"
+			agentPath="${config.agent.path}">
+			<a2a:interfaces>
+				<a2a:interface protocol="JSONRPC" path="/rpc" />
+			</a2a:interfaces>
+		</a2a:connection>
+		<a2a:agent-card>
+			<a2a:json><![CDATA[{
   "name": "TechWave Order Support Agent",
   "version": "1.0.0",
   "protocolVersion": "1.0",
@@ -86,40 +101,38 @@
   "defaultInputModes": ["text/plain"],
   "defaultOutputModes": ["text/plain"]
 }]]></a2a:json>
-    </a2a:agent-card>
-  </a2a:server-config>
+		</a2a:agent-card>
+	</a2a:server-config>
 
-  <!-- OpenAI Responses API -->
-  <http:request-config name="openai-request-config" basePath="${config.openai.basePath}"
-    doc:name="OpenAI API"
-    doc:description="Outbound HTTPS client for the OpenAI Responses API, authenticated with the secure API key">
-    <http:request-connection host="${config.openai.host}" protocol="HTTPS" port="443"/>
-    <http:default-headers>
-      <http:default-header key="Authorization" value="Bearer ${secure::openai.api.key}"/>
-    </http:default-headers>
-  </http:request-config>
+	<!-- OpenAI Responses API -->
+	<http:request-config name="openai-request-config"
+		basePath="${config.openai.basePath}" doc:name="OpenAI API"
+		doc:description="Outbound HTTPS client for the OpenAI Responses API, authenticated with the secure API key">
+		<http:request-connection
+			host="${config.openai.host}" protocol="HTTPS" port="443" />
+		<http:default-headers>
+			<http:default-header key="Authorization"
+				value="Bearer ${secure::openai.api.key}" />
+		</http:default-headers>
+	</http:request-config>
 
-  <!-- MCP Client: TechWave Support MCP Server via egress Omni GW.
-       As default request headers carregam o contrato "agent-to-mcp-server":
-       a Tool/MCP instance no API Manager tem Client ID Enforcement, então toda
-       chamada de tool precisa apresentar client_id/client_secret. Sem isso o
-       gateway devolve 401 antes de chegar no MCP server.
-       Atenção ao XSD: <reconnection> é filho de <mcp:client-config>, NÃO de
-       <mcp:streamable-http-client-connection>. -->
-  <mcp:client-config name="techwave-mcp-client" clientName="Order Support Agent" clientVersion="1.0.0"
-    doc:name="TechWave Support MCP Client"
-    doc:description="MCP client connecting to the TechWave Support MCP Server via the egress Omni Gateway, authenticated with the agent-to-mcp-server contract credentials">
-    <mcp:streamable-http-client-connection
-      serverUrl="${config.mcp.serverUrl}"
-      mcpEndpointPath="${config.mcp.endpointPath}">
-      <mcp:default-request-headers>
-        <mcp:default-request-header key="client_id" value="${config.mcp.clientId}"/>
-        <mcp:default-request-header key="client_secret" value="${secure::mcp.clientSecret}"/>
-      </mcp:default-request-headers>
-    </mcp:streamable-http-client-connection>
-    <reconnection>
-      <reconnect-forever frequency="5000"/>
-    </reconnection>
-  </mcp:client-config>
-
+	<!-- MCP Client: TechWave Support MCP Server via egress Omni GW. As default 
+		request headers carregam o contrato "agent-to-mcp-server": a Tool/MCP instance 
+		no API Manager tem Client ID Enforcement, então toda chamada de tool precisa 
+		apresentar client_id/client_secret. Sem isso o gateway devolve 401 antes 
+		de chegar no MCP server. Atenção ao XSD: <reconnection> é filho de <mcp:client-config>, 
+		NÃO de <mcp:streamable-http-client-connection>. -->
+	<mcp:client-config name="techwave-mcp-client"
+		clientName="Order Support Agent" clientVersion="1.0.0"
+		doc:name="TechWave Support MCP Client"
+		doc:description="MCP client connecting to the TechWave Support MCP Server via the egress Omni Gateway, authenticated with the agent-to-mcp-server contract credentials">
+		<mcp:streamable-http-client-connection
+			serverUrl="${config.mcp.serverUrl}"
+			mcpEndpointPath="${config.mcp.endpointPath}">
+			<mcp:default-request-headers>
+				<mcp:default-request-header key="client_id" value="${config.mcp.clientId}"/>
+				<mcp:default-request-header key="client_secret" value="${secure::mcp.clientSecret}"/>
+			</mcp:default-request-headers>
+		</mcp:streamable-http-client-connection>
+	</mcp:client-config>
 </mule>

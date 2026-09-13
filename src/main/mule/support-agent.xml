@@ -26,17 +26,14 @@
   <flow name="support-agent-main-flow"
     doc:name="Order Support Agent Flow"
     doc:description="A2A agent: receives a task, lets OpenAI pick MCP tools, runs them, then returns the final answer">
+    <!-- A2A Connector 2.0: o task-listener é UNIFICADO e não recebe mais um bloco
+         <a2a:response>. O flow não devolve um Task como payload: ele emite eventos
+         com <a2a:update-task-artifact> / <a2a:update-task-status>, e o connector
+         materializa a resposta ao receber um status TERMINAL (ver fim do flow).
+         O mesmo listener atende SendMessage bloqueante, não-bloqueante e streaming. -->
     <a2a:task-listener config-ref="order-support-a2a-server"
       doc:name="A2A Task Listener"
-      doc:description="Receives inbound A2A tasks for the Order Support Agent and returns the task response">
-      <a2a:response>
-        <a2a:response><![CDATA[#[payload]]]></a2a:response>
-        <a2a:response-headers><![CDATA[#[%dw 2.0
-output application/java
----
-{ "Content-Type": "application/json" }]]]></a2a:response-headers>
-      </a2a:response>
-    </a2a:task-listener>
+      doc:description="Recebe tasks A2A do Order Support Agent (blocking, non-blocking e streaming)"/>
 
     <ee:transform doc:name="Extract task vars"
       doc:description="Extracts taskId, contextId and the user prompt text from the incoming A2A task">
@@ -59,75 +56,96 @@ payload]]></ee:set-payload>
       message="#[output application/json --- {message: 'A2A task received', tracePoint: 'START'} ++ ({ taskId: vars.taskId, userPrompt: vars.userPrompt })]"/>
 
     <!-- 1a chamada OpenAI: decide quais tools usar -->
+    <!-- Prompt e catálogo de tools como VARIÁVEIS, não embutidos na 1a requisição.
+         Motivo: a Responses API restaura o histórico via previous_response_id, mas
+         `tools` é por requisição — ela não herda as definições da chamada anterior.
+         Enquanto o catálogo viveu só dentro da 1a chamada, a 2a era fisicamente
+         incapaz de pedir outra tool: o modelo não tinha nenhuma declarada. Era a
+         segunda metade da causa de "o reembolso saiu mas o Slack não". -->
+    <ee:transform doc:name="Set system prompt e tool defs"
+      doc:description="Stores the system prompt and the tool catalogue as vars, reused by every round of the tool-calling loop">
+      <ee:variables>
+        <ee:set-variable variableName="systemPrompt"><![CDATA[%dw 2.0
+output application/java
+---
+"Voce e o agente de suporte de pedidos da TechWave Electronics. " ++
+"Responda em portugues, de forma curta e objetiva. " ++
+"Use as tools disponiveis para consultar pedidos, abrir cases, processar reembolsos e notificar o time. " ++
+"Nunca invente dados de pedidos: sempre consulte get-order-status primeiro. " ++
+"GUARDRAIL DE REEMBOLSO: antes de chamar refund-payment, verifique o payment.status retornado por get-order-status. " ++
+"Se o pagamento ja estiver como refunded, NAO chame refund-payment: informe educadamente que o reembolso ja foi processado e nao crie um novo. " ++
+"Trabalhe em etapas: peca uma tool de cada vez quando o resultado da proxima depender da anterior. " ++
+"Apos criar um case ou reembolso, notifique o time com notify-team antes de dar a resposta final."]]></ee:set-variable>
+        <ee:set-variable variableName="toolDefs"><![CDATA[%dw 2.0
+output application/java
+---
+[
+  {
+    "type": "function",
+    name: "get-order-status",
+    description: "Retorna status, itens e pagamento de um pedido TechWave",
+    parameters: {
+      "type": "object",
+      properties: { orderId: { "type": "string", description: "Id do pedido, ex.: TW-1001" } },
+      required: ["orderId"]
+    }
+  },
+  {
+    "type": "function",
+    name: "create-support-case",
+    description: "Abre um Case de suporte no Salesforce",
+    parameters: {
+      "type": "object",
+      properties: {
+        orderId: { "type": "string" },
+        subject: { "type": "string" },
+        description: { "type": "string" },
+        priority: { "type": "string", "enum": ["Low", "Medium", "High"] }
+      },
+      required: ["orderId", "subject", "description", "priority"]
+    }
+  },
+  {
+    "type": "function",
+    name: "refund-payment",
+    description: "Cria reembolso total no Stripe para um PaymentIntent",
+    parameters: {
+      "type": "object",
+      properties: {
+        paymentIntentId: { "type": "string" },
+        reason: { "type": "string", "enum": ["duplicate", "fraudulent", "requested_by_customer"] }
+      },
+      required: ["paymentIntentId", "reason"]
+    }
+  },
+  {
+    "type": "function",
+    name: "notify-team",
+    description: "Envia notificacao ao canal de suporte no Slack",
+    parameters: {
+      "type": "object",
+      properties: { message: { "type": "string" } },
+      required: ["message"]
+    }
+  }
+]]]></ee:set-variable>
+      </ee:variables>
+    </ee:transform>
+
+    <!-- 1a chamada OpenAI: abre a conversa e decide a primeira tool -->
     <ee:transform doc:name="Build OpenAI request (with tools)"
-      doc:description="Builds the first OpenAI request with the system prompt, user prompt and the four tool definitions">
+      doc:description="Builds the first OpenAI request with the system prompt, user prompt and the tool catalogue">
       <ee:message>
         <ee:set-payload><![CDATA[%dw 2.0
 output application/json
-var systemPrompt = "Voce e o agente de suporte de pedidos da TechWave Electronics. " ++
-  "Responda em portugues, de forma curta e objetiva. " ++
-  "Use as tools disponiveis para consultar pedidos, abrir cases, processar reembolsos e notificar o time. " ++
-  "Nunca invente dados de pedidos: sempre consulte get-order-status primeiro. " ++
-  "GUARDRAIL DE REEMBOLSO: antes de chamar refund-payment, verifique o payment.status retornado por get-order-status. " ++
-  "Se o pagamento ja estiver como refunded, NAO chame refund-payment: informe educadamente que o reembolso ja foi processado e nao crie um novo. " ++
-  "Apos criar um case ou reembolso, notifique o time com notify-team."
 ---
 {
   model: p('config.openai.model'),
   'input': [
-    { role: "system", content: systemPrompt },
+    { role: "system", content: vars.systemPrompt },
     { role: "user", content: vars.userPrompt }
   ],
-  tools: [
-    {
-      "type": "function",
-      name: "get-order-status",
-      description: "Retorna status, itens e pagamento de um pedido TechWave",
-      parameters: {
-        "type": "object",
-        properties: { orderId: { "type": "string", description: "Id do pedido, ex.: TW-1001" } },
-        required: ["orderId"]
-      }
-    },
-    {
-      "type": "function",
-      name: "create-support-case",
-      description: "Abre um Case de suporte no Salesforce",
-      parameters: {
-        "type": "object",
-        properties: {
-          orderId: { "type": "string" },
-          subject: { "type": "string" },
-          description: { "type": "string" },
-          priority: { "type": "string", "enum": ["Low", "Medium", "High"] }
-        },
-        required: ["orderId", "subject", "description", "priority"]
-      }
-    },
-    {
-      "type": "function",
-      name: "refund-payment",
-      description: "Cria reembolso total no Stripe para um PaymentIntent",
-      parameters: {
-        "type": "object",
-        properties: {
-          paymentIntentId: { "type": "string" },
-          reason: { "type": "string", "enum": ["duplicate", "fraudulent", "requested_by_customer"] }
-        },
-        required: ["paymentIntentId", "reason"]
-      }
-    },
-    {
-      "type": "function",
-      name: "notify-team",
-      description: "Envia notificacao ao canal de suporte no Slack",
-      parameters: {
-        "type": "object",
-        properties: { message: { "type": "string" } },
-        required: ["message"]
-      }
-    }
-  ]
+  tools: vars.toolDefs
 }]]></ee:set-payload>
       </ee:message>
     </ee:transform>
@@ -148,155 +166,119 @@ var systemPrompt = "Voce e o agente de suporte de pedidos da TechWave Electronic
         toolCalls: sizeOf((payload.'output' default []) filter ($.'type' == 'function_call'))
       })]"/>
 
-    <set-variable variableName="openaiResponseId" value="#[payload.id]"
-      doc:name="Set openaiResponseId"
-      doc:description="Stores the Responses API response id for the follow-up call with tool outputs"/>
-    <set-variable variableName="toolCalls" value="#[(payload.'output' default []) filter ($.'type' == 'function_call')]"
-      doc:name="Set toolCalls"
-      doc:description="Stores the Responses API function_call output items for MCP execution"/>
-    <set-variable variableName="assistantText" value="#[((payload.'output' default []) filter ($.'type' == 'message'))[0].content[0].text default null]"
-      doc:name="Set assistantText"
-      doc:description="Stores the direct assistant text when no tool calls are needed"/>
-    <set-variable variableName="toolResults" value="#[[]]"
-      doc:name="Init toolResults"
-      doc:description="Initialises the empty list that will collect MCP tool results"/>
+    <flow-ref name="support-agent-extract-llm-response"
+      doc:name="Extract LLM response"
+      doc:description="Reads responseId, tool calls and assistant text out of the Responses API payload"/>
 
-    <choice doc:name="Tool calls requested?"
-      doc:description="Branches on whether OpenAI requested any tool calls">
+    <set-variable variableName="toolIteration" value="#[0]"
+      doc:name="Init toolIteration"
+      doc:description="Initialises the tool-calling loop counter"/>
+
+    <!-- Loop de tool-calling. Antes daqui havia exatamente duas chamadas ao LLM:
+         a segunda já produzia o texto final, então qualquer caso multi-passo
+         (consultar pedido -> reembolsar -> abrir case -> avisar o time) morria na
+         primeira etapa.
+
+         O loop é um foreach sobre um range fixo, não uma sub-flow recursiva: o
+         range já é o teto (não dá para passar dele nem por engano) e tudo roda num
+         escopo só, então as variáveis do round seguem visíveis sem depender de
+         propagação entre flows. Cada iteração só faz trabalho enquanto o modelo
+         ainda estiver pedindo tools; depois disso ela é um no-op barato. -->
+    <foreach collection="#[1 to ((p('config.agent.maxToolIterations') default '5') as Number)]"
+      doc:name="Rodadas de tool-calling"
+      doc:description="Runs at most maxToolIterations rounds; each round is skipped once the model stops asking for tools">
+      <choice doc:name="Ainda há tools pendentes?"
+        doc:description="Executes another round only while the model keeps requesting tools">
+        <when expression="#[not isEmpty(vars.toolCalls default [])]"
+          doc:name="Sim: mais uma rodada">
+          <flow-ref name="support-agent-tool-round"
+            doc:name="Rodada de tool-calling"
+            doc:description="Executes the pending MCP tools and feeds the results back to the LLM"/>
+        </when>
+      </choice>
+    </foreach>
+
+    <!-- Teto atingido com tools ainda pendentes: o modelo não chegou a uma
+         resposta. Fica registrado como WARN — nunca em silêncio — e o finalAnswer
+         abaixo cai no texto de handoff. Não tentamos "forçar" uma resposta extra:
+         a Responses API recusa a requisição seguinte enquanto houver function_call
+         sem o function_call_output correspondente. -->
+    <choice doc:name="Teto atingido?"
+      doc:description="Warns when maxToolIterations truncated the conversation with tool calls still pending">
       <when expression="#[not isEmpty(vars.toolCalls default [])]"
-        doc:name="Tools requested"
-        doc:description="Runs each requested MCP tool then asks OpenAI for the final answer">
-
-        <foreach collection="#[vars.toolCalls]"
-          doc:name="For each tool call"
-          doc:description="Iterates over every tool call OpenAI requested">
-          <set-variable variableName="currentCall" value="#[payload]"
-            doc:name="Set currentCall"
-            doc:description="Stores the current tool call being processed"/>
-
-          <logger level="INFO" category="com.techwave.support.agent"
-            doc:name="Before MCP tool call"
-            doc:description="Logs BEFORE_REQUEST with the name of the MCP tool about to be called"
-            message="#[output application/json --- {message: 'Calling MCP tool: ' ++ vars.currentCall.name, tracePoint: 'BEFORE_REQUEST'} ++ ({
-              arguments: vars.currentCall.arguments default '{}'
-            })]"/>
-
-          <mcp:call-tool config-ref="techwave-mcp-client" toolName="#[vars.currentCall.name]"
-            doc:name="Call MCP tool"
-            doc:description="Invokes the named MCP tool on the TechWave Support MCP Server with the parsed arguments">
-            <mcp:arguments><![CDATA[#[output application/java
----
-read(vars.currentCall.arguments default "{}", "application/json")]]]></mcp:arguments>
-          </mcp:call-tool>
-
-          <ee:transform doc:name="Extract MCP tool output"
-            doc:description="Extracts the raw MCP text content for the OpenAI Responses function_call_output item">
-            <ee:variables>
-              <ee:set-variable variableName="toolOutput"><![CDATA[%dw 2.0
-output application/java
-var rawText = attributes.rawMcpResponse.contents[0].text default payload.contents[0].text default null
----
-rawText default write(payload, "application/json") default "sem resultado"
-]]></ee:set-variable>
-            </ee:variables>
-          </ee:transform>
-
-          <logger level="INFO" category="com.techwave.support.agent"
-            doc:name="After MCP tool call"
-            doc:description="Logs AFTER_REQUEST once the MCP tool has responded"
-            message="#[output application/json --- {message: 'MCP tool responded: ' ++ vars.currentCall.name, tracePoint: 'AFTER_REQUEST'} ++ ({
-              resultPreview: vars.toolOutput
-            })]"/>
-
-          <ee:transform doc:name="Append tool result"
-            doc:description="Appends the MCP tool result as a Responses API function_call_output keyed by call_id">
-            <ee:variables>
-              <ee:set-variable variableName="toolResults"><![CDATA[%dw 2.0
-output application/java
----
-vars.toolResults ++ [{
-  'type': 'function_call_output',
-  call_id: vars.currentCall.call_id,
-  'output': vars.toolOutput
-}]]]></ee:set-variable>
-            </ee:variables>
-          </ee:transform>
-        </foreach>
-
-        <!-- 2a chamada OpenAI: resposta final com os resultados das tools -->
-        <ee:transform doc:name="Build OpenAI request (final answer)"
-          doc:description="Builds the second OpenAI request, appending the assistant message and tool results">
-          <ee:message>
-            <ee:set-payload><![CDATA[%dw 2.0
-output application/json
----
-{
-  model: p('config.openai.model'),
-  previous_response_id: vars.openaiResponseId,
-  'input': vars.toolResults
-}]]></ee:set-payload>
-          </ee:message>
-        </ee:transform>
-
-        <logger level="INFO" category="com.techwave.support.agent"
-          doc:name="Before OpenAI call 2"
-          doc:description="Logs BEFORE_REQUEST before the second OpenAI call (final answer)"
-          message="#[output application/json --- {message: 'Calling OpenAI (final answer)', tracePoint: 'BEFORE_REQUEST'}]"/>
-
-        <http:request config-ref="openai-request-config" method="POST" path="/responses" responseTimeout="60000"
-          doc:name="OpenAI final answer"
-          doc:description="Calls OpenAI Responses API again with the tool results to produce the final answer"/>
-
-        <logger level="INFO" category="com.techwave.support.agent"
-          doc:name="After OpenAI call 2"
-          doc:description="Logs AFTER_REQUEST once OpenAI has returned the final answer"
-          message="#[output application/json --- {message: 'OpenAI responded (final answer)', tracePoint: 'AFTER_REQUEST'}]"/>
-
-        <set-variable variableName="finalAnswer" value="#[((payload.'output' default []) filter ($.'type' == 'message'))[0].content[0].text default 'Nao consegui processar a solicitacao.']"
-          doc:name="Set finalAnswer"
-          doc:description="Stores the OpenAI final answer text for the A2A response"/>
+        doc:name="Truncado pelo teto">
+        <logger level="WARN" category="com.techwave.support.agent"
+          doc:name="Log teto atingido"
+          doc:description="Logs the pending tools left unexecuted when the ceiling stopped the loop"
+          message="#[output application/json --- {message: 'Tool-calling ceiling reached with pending tool calls', tracePoint: 'EXCEPTION'} ++ ({
+            taskId: vars.taskId default 'unknown',
+            rounds: vars.toolIteration default 0,
+            pendingTools: (vars.toolCalls default []) map ($.name)
+          })]"/>
       </when>
-      <otherwise doc:name="No tools requested"
-        doc:description="Uses the assistant message directly when OpenAI requested no tools">
-        <set-variable variableName="finalAnswer"
-          value="#[vars.assistantText default 'Nao consegui processar a solicitacao.']"
-          doc:name="Set finalAnswer (no tools)"
-          doc:description="Stores the assistant content, or a fallback message when none is present"/>
+      <otherwise doc:name="Fim natural">
+        <logger level="INFO" category="com.techwave.support.agent"
+          doc:name="Log fim do loop"
+          doc:description="Logs how many rounds the loop needed before the model answered with text"
+          message="#[output application/json --- {message: 'Tool-calling loop finished', tracePoint: 'END'} ++ ({
+            taskId: vars.taskId default 'unknown',
+            rounds: vars.toolIteration default 0
+          })]"/>
       </otherwise>
     </choice>
 
-    <!-- Resposta A2A (task completed) — A2A protocol 1.0.0:
-         - estados usam constantes TASK_STATE_* (antes: "completed" minúsculo)
-         - role usa constantes ROLE_* (antes: "agent")
-         - Task/Message/Part não têm mais o discriminador "kind": o tipo do Part
-           é inferido pela chave presente ({ text: ... } = TextPart) -->
-    <ee:transform doc:name="Build A2A task response"
-      doc:description="Builds the completed A2A 1.0 task response with the final answer as message and artifact">
-      <ee:message>
-        <ee:set-payload><![CDATA[%dw 2.0
+    <set-variable variableName="finalAnswer"
+      value="#[vars.assistantText default 'Nao consegui concluir a solicitacao. Um atendente vai assumir o caso.']"
+      doc:name="Set finalAnswer"
+      doc:description="Uses the last assistant text; falls back to a handoff message when the loop ended without one"/>
+
+    <!-- Resposta A2A — protocol 1.0.0 / Connector 2.0.
+         O flow NÃO devolve um Task: ele emite eventos no formato StreamResponse
+         (raiz única `artifactUpdate` ou `statusUpdate`). O connector materializa o
+         Task a partir do estado persistido quando chega um status TERMINAL.
+         Estados são constantes TASK_STATE_*, papéis são ROLE_*, e Part não tem
+         campo `kind` (o tipo vem da chave presente: { text: ... } = TextPart). -->
+
+    <a2a:update-task-artifact config-ref="order-support-a2a-server"
+      doc:name="Artifact: resposta ao cliente"
+      doc:description="Publica a resposta final como artifact da task">
+      <a2a:artifact-content><![CDATA[#[%dw 2.0
 output application/json
 ---
 {
-  id: vars.taskId,
-  contextId: vars.contextId,
-  status: {
-    state: "TASK_STATE_COMPLETED",
-    message: {
-      role: "ROLE_AGENT",
-      messageId: uuid(),
-      parts: [{ text: vars.finalAnswer }]
-    }
-  },
-  artifacts: [
-    {
+  artifactUpdate: {
+    taskId: vars.taskId,
+    contextId: vars.contextId,
+    artifact: {
       artifactId: "artifact-" ++ vars.taskId,
       name: "answer",
       parts: [{ text: vars.finalAnswer }]
     }
-  ]
-}]]></ee:set-payload>
-      </ee:message>
-    </ee:transform>
+  }
+}]]]></a2a:artifact-content>
+    </a2a:update-task-artifact>
+
+    <a2a:update-task-status config-ref="order-support-a2a-server"
+      doc:name="Status: completed"
+      doc:description="Status terminal — dispara a materialização da resposta ao cliente">
+      <a2a:status-content><![CDATA[#[%dw 2.0
+output application/json
+---
+{
+  statusUpdate: {
+    taskId: vars.taskId,
+    contextId: vars.contextId,
+    status: {
+      state: "TASK_STATE_COMPLETED",
+      message: {
+        messageId: uuid(),
+        role: "ROLE_AGENT",
+        parts: [{ text: vars.finalAnswer }]
+      }
+    }
+  }
+}]]]></a2a:status-content>
+    </a2a:update-task-status>
 
     <logger level="INFO" category="com.techwave.support.agent"
       doc:name="Flow end"
@@ -313,28 +295,184 @@ output application/json
             errorType: error.errorType.identifier default 'UNKNOWN',
             errorDescription: error.description
           })]"/>
-        <ee:transform doc:name="Build A2A failed task"
-          doc:description="Builds a failed A2A task response carrying a friendly error message back to the caller">
-          <ee:message>
-            <ee:set-payload><![CDATA[%dw 2.0
+        <!-- TASK_STATE_FAILED também é terminal: dispara a materialização da
+             resposta, então o cliente A2A recebe uma task malformada-zero, com a
+             mensagem de erro, em vez de um 500 cru. -->
+        <a2a:update-task-status config-ref="order-support-a2a-server"
+          doc:name="Status: failed"
+          doc:description="Status terminal de falha, com mensagem amigável ao cliente">
+          <a2a:status-content><![CDATA[#[%dw 2.0
 output application/json
 ---
 {
-  id: vars.taskId default uuid(),
-  contextId: vars.contextId default "context-error",
-  status: {
-    state: "TASK_STATE_FAILED",
-    message: {
-      role: "ROLE_AGENT",
-      messageId: uuid(),
-      parts: [{ text: "Desculpe, ocorreu um erro ao processar sua solicitacao: " ++ (error.description default "erro inesperado") }]
+  statusUpdate: {
+    taskId: vars.taskId default uuid(),
+    contextId: vars.contextId default ("context-" ++ uuid()),
+    status: {
+      state: "TASK_STATE_FAILED",
+      message: {
+        messageId: uuid(),
+        role: "ROLE_AGENT",
+        parts: [{ text: "Desculpe, ocorreu um erro ao processar sua solicitacao: " ++ (error.description default "erro inesperado") }]
+      }
     }
   }
-}]]></ee:set-payload>
-          </ee:message>
-        </ee:transform>
+}]]]></a2a:status-content>
+        </a2a:update-task-status>
       </on-error-continue>
     </error-handler>
   </flow>
+
+  <!-- ============================================================
+       Extração da resposta da Responses API
+       Usado pela 1a chamada e por cada rodada do loop — daí ser sub-flow
+       em vez de repetir os mesmos três set-variable nos dois lugares.
+       ============================================================ -->
+  <sub-flow name="support-agent-extract-llm-response"
+    doc:name="Extract LLM response"
+    doc:description="Extracts responseId, function_call items and assistant text from a Responses API payload">
+    <set-variable variableName="openaiResponseId" value="#[payload.id]"
+      doc:name="Set openaiResponseId"
+      doc:description="Stores the Responses API response id, used as previous_response_id on the next round"/>
+    <set-variable variableName="toolCalls" value="#[(payload.'output' default []) filter ($.'type' == 'function_call')]"
+      doc:name="Set toolCalls"
+      doc:description="Stores the function_call output items still pending MCP execution"/>
+    <set-variable variableName="assistantText" value="#[((payload.'output' default []) filter ($.'type' == 'message'))[0].content[0].text default null]"
+      doc:name="Set assistantText"
+      doc:description="Stores the assistant text, present only when the model stopped asking for tools"/>
+  </sub-flow>
+
+  <!-- ============================================================
+       Uma rodada do loop de tool-calling (Correção B)
+       Executa as tools pendentes -> devolve os function_call_output ao
+       LLM -> lê a resposta nova (que pode trazer outras tools).
+
+       É sub-flow, e não flow: sub-flow é inlinado e compartilha o escopo
+       de variáveis de quem chama, então o contador e a lista de tools
+       atravessam as rodadas sem depender de propagação entre flows. Quem
+       controla a repetição é o foreach do flow principal.
+       ============================================================ -->
+  <sub-flow name="support-agent-tool-round"
+    doc:name="Tool-calling round"
+    doc:description="One round: executes the pending MCP tools and feeds their outputs back to the LLM">
+
+    <set-variable variableName="toolIteration" value="#[(vars.toolIteration default 0) + 1]"
+      doc:name="Increment toolIteration"
+      doc:description="Counts this round against the maxToolIterations ceiling"/>
+
+    <logger level="INFO" category="com.techwave.support.agent"
+      doc:name="Loop round start"
+      doc:description="Logs the round number and which tools this round will execute"
+      message="#[output application/json --- {message: 'Tool-calling round', tracePoint: 'START'} ++ ({
+        taskId: vars.taskId default 'unknown',
+        round: vars.toolIteration,
+        tools: (vars.toolCalls default []) map ($.name)
+      })]"/>
+
+    <!-- toolResults zera a cada rodada: com previous_response_id o histórico já
+         está no servidor, então reenviar os outputs das rodadas anteriores
+         repetiria call_ids já satisfeitos. -->
+    <set-variable variableName="toolResults" value="#[[]]"
+      doc:name="Reset toolResults"
+      doc:description="Clears the tool results list — only this round's outputs go back to the LLM"/>
+
+    <foreach collection="#[vars.toolCalls]"
+      doc:name="For each tool call"
+      doc:description="Iterates over every tool call the model requested in this round">
+      <set-variable variableName="currentCall" value="#[payload]"
+        doc:name="Set currentCall"
+        doc:description="Stores the current tool call being processed"/>
+
+      <logger level="INFO" category="com.techwave.support.agent"
+        doc:name="Before MCP tool call"
+        doc:description="Logs BEFORE_REQUEST with the name of the MCP tool about to be called"
+        message="#[output application/json --- {message: 'Calling MCP tool: ' ++ vars.currentCall.name, tracePoint: 'BEFORE_REQUEST'} ++ ({
+          round: vars.toolIteration,
+          arguments: vars.currentCall.arguments default '{}'
+        })]"/>
+
+      <mcp:call-tool config-ref="techwave-mcp-client" toolName="#[vars.currentCall.name]"
+        doc:name="Call MCP tool"
+        doc:description="Invokes the named MCP tool on the TechWave Support MCP Server with the parsed arguments">
+        <mcp:arguments><![CDATA[#[output application/java
+---
+read(vars.currentCall.arguments default "{}", "application/json")]]]></mcp:arguments>
+      </mcp:call-tool>
+
+      <ee:transform doc:name="Extract MCP tool output"
+        doc:description="Extracts the raw MCP text content for the OpenAI Responses function_call_output item">
+        <ee:variables>
+          <ee:set-variable variableName="toolOutput"><![CDATA[%dw 2.0
+output application/java
+var rawText = attributes.rawMcpResponse.contents[0].text default payload.contents[0].text default null
+---
+rawText default write(payload, "application/json") default "sem resultado"
+]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+
+      <logger level="INFO" category="com.techwave.support.agent"
+        doc:name="After MCP tool call"
+        doc:description="Logs AFTER_REQUEST once the MCP tool has responded"
+        message="#[output application/json --- {message: 'MCP tool responded: ' ++ vars.currentCall.name, tracePoint: 'AFTER_REQUEST'} ++ ({
+          round: vars.toolIteration,
+          resultPreview: vars.toolOutput
+        })]"/>
+
+      <ee:transform doc:name="Append tool result"
+        doc:description="Appends the MCP tool result as a Responses API function_call_output keyed by call_id">
+        <ee:variables>
+          <ee:set-variable variableName="toolResults"><![CDATA[%dw 2.0
+output application/java
+---
+vars.toolResults ++ [{
+  'type': 'function_call_output',
+  call_id: vars.currentCall.call_id,
+  'output': vars.toolOutput
+}]]]></ee:set-variable>
+        </ee:variables>
+      </ee:transform>
+    </foreach>
+
+    <!-- Devolve os resultados ao LLM. `tools` vai junto de novo: sem isso o
+         modelo não teria como pedir a próxima tool e a conversa encerraria aqui
+         — que era exatamente metade do bug. -->
+    <ee:transform doc:name="Build OpenAI request (tool results)"
+      doc:description="Builds the follow-up request with this round's tool outputs and the tool catalogue">
+      <ee:message>
+        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  model: p('config.openai.model'),
+  previous_response_id: vars.openaiResponseId,
+  'input': vars.toolResults,
+  tools: vars.toolDefs
+}]]></ee:set-payload>
+      </ee:message>
+    </ee:transform>
+
+    <logger level="INFO" category="com.techwave.support.agent"
+      doc:name="Before OpenAI call (loop)"
+      doc:description="Logs BEFORE_REQUEST before feeding the tool results back to OpenAI"
+      message="#[output application/json --- {message: 'Calling OpenAI (tool results)', tracePoint: 'BEFORE_REQUEST'} ++ ({ round: vars.toolIteration })]"/>
+
+    <http:request config-ref="openai-request-config" method="POST" path="/responses" responseTimeout="60000"
+      doc:name="OpenAI next step"
+      doc:description="Calls OpenAI Responses API with the tool outputs to get the next tool call or the final answer"/>
+
+    <logger level="INFO" category="com.techwave.support.agent"
+      doc:name="After OpenAI call (loop)"
+      doc:description="Logs AFTER_REQUEST with how many further tool calls the model asked for"
+      message="#[output application/json --- {message: 'OpenAI responded (tool results)', tracePoint: 'AFTER_REQUEST'} ++ ({
+        round: vars.toolIteration,
+        toolCalls: sizeOf((payload.'output' default []) filter ($.'type' == 'function_call'))
+      })]"/>
+
+    <flow-ref name="support-agent-extract-llm-response"
+      doc:name="Extract LLM response"
+      doc:description="Reads responseId, tool calls and assistant text out of the Responses API payload"/>
+
+  </sub-flow>
 
 </mule>
