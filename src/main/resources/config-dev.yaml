@@ -27,4 +27,4 @@ config:
     # client_id do contrato "agent-to-mcp-server" (Tool/MCP instance
     # techwave-support-mcp-server com Client ID Enforcement).
     # O client_secret correspondente é secure property: mcp.clientSecret
-    clientId: "<client_id-do-contrato>"
+    clientId: "<client_id do contrato agent-to-mcp-server>"
