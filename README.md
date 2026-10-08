@@ -4,12 +4,20 @@ Agente **A2A** de suporte de pedidos da TechWave Electronics (demo do MuleSoft M
 Recebe uma pergunta em linguagem natural, decide quais tools MCP chamar via tool-calling
 (Azure OpenAI `/responses`) e devolve a resposta como uma task A2A.
 
-- **Protocolo:** A2A 1.0.0 (A2A Connector 2.0) · JSON-RPC em `/agents/order-support/rpc`
+- **Protocolo:** A2A 1.0.0 (A2A Connector 2.0) · JSON-RPC em `${config.agent.path}/rpc`
+  (`/techwave-order-support-agent/rpc`) — o `agentPath` tem que ser igual ao base path
+  público da instância no gateway, ver a nota de bijeção abaixo
 - **Consome:** [`demo-support-mcp-server`](../demo-support-mcp-server) via MCP (Streamable HTTP)
 - **Runtime:** Mule 4.12 · Java 17 · CloudHub 2.0
 
-> Parte de uma demo com 4 repositórios. Arquitetura, walkthrough completo, políticas de gateway
-> e roteiro de apresentação: **`meetup-omni-material`**.
+> Parte de uma demo com quatro repositórios, que só faz sentido completa:
+>
+> - [`demo-order-support-api`](https://github.com/mule-meetups-ctba/demo-order-support-api) — API REST de pedidos + consulta do pagamento no Stripe
+> - [`demo-support-mcp-server`](https://github.com/mule-meetups-ctba/demo-support-mcp-server) — MCP server com as quatro tools de suporte
+> - [`demo-omni-agent-network`](https://github.com/mule-meetups-ctba/demo-omni-agent-network) — Agent Network 2.0 + broker em AgentScript
+>
+> A arquitetura, o passo a passo de deploy e as políticas de gateway estão
+> descritos no artigo que acompanha a demo.
 
 ## Como funciona
 
